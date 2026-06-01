@@ -4,6 +4,8 @@
 
 A pure PowerShell tool for penetration testers to identify DLL hijacking vectors in restricted environments where Process Monitor cannot be run (no GUI, limited tooling, AV blocking SysInternals).
 
+**v2.0 highlight:** Parses PE import tables of running processes and services to find missing DLLs -- the equivalent of Procmon's "NAME NOT FOUND" filter, entirely in PowerShell.
+
 ---
 
 ## The Problem
@@ -16,6 +18,8 @@ During a penetration test, you might have a low-privilege shell with no ability 
 
 | Check | What It Finds |
 |-------|---------------|
+| **Missing DLL Detection** | **Parses PE import tables to find DLLs that processes import but can't find -- the Procmon "NAME NOT FOUND" replacement** |
+| **Event Log DLL Errors** | SideBySide, Application, and SCM errors revealing DLL load failures |
 | **PATH Directory Permissions** | Directories in the system PATH that the current user can write to |
 | **Service Binary Directories** | Services running from writable directories (DLL planting) |
 | **Unquoted Service Paths** | Services with unquoted paths containing spaces (binary planting) |
