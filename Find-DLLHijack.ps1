@@ -13,9 +13,9 @@
     (restricted environments, no GUI, limited tooling).
 
 .NOTES
-    Author:  Dimitry / Eureka IT
+    Author:  Dimitry / Funway Interactive SRL
     License: MIT
-    URL:     https://github.com/TODO
+    URL:     https://github.com/FunwayHQ/Find-HijackDLL
 
 .EXAMPLE
     . .\Find-DLLHijack.ps1
@@ -659,7 +659,20 @@ function Get-MissingDLLs {
         "msvcrt.dll", "ucrtbase.dll", "combase.dll", "rpcrt4.dll",
         "sechost.dll", "bcrypt.dll", "kernelbase.dll", "msvcp_win.dll",
         "win32u.dll", "mscoree.dll", "vcruntime140.dll", "vcruntime140d.dll",
-        "ucrtbased.dll", "msvcp140.dll", "msvcp140d.dll"
+        "ucrtbased.dll", "msvcp140.dll", "msvcp140d.dll",
+        # Internal loader DLLs (resolved outside standard search)
+        "chrome_elf.dll", "chrome.dll", "libcef.dll", "node.dll",
+        "ffmpeg.dll", "libglesv2.dll", "libegl.dll", "vk_swiftshader.dll"
+    )
+
+    # Protected directories where DLL planting is not possible
+    $protectedDirPatterns = @(
+        "\\Windows\\System32",
+        "\\Windows\\SysWOW64",
+        "\\Windows\\WinSxS",
+        "\\WindowsApps\\",
+        "\\SystemApps\\",
+        "\\Windows\\assembly"
     )
 
     function ShouldIgnoreDLL {
@@ -671,6 +684,17 @@ function Get-MissingDLLs {
         }
         return $false
     }
+
+    function IsProtectedDirectory {
+        param([string]$dir)
+        foreach ($pattern in $protectedDirPatterns) {
+            if ($dir -match [regex]::Escape($pattern)) { return $true }
+        }
+        return $false
+    }
+
+    # Track unique findings to avoid duplicates
+    $seenFindings = @{}
 
     # Scan running processes
     $processes = Get-Process -ErrorAction SilentlyContinue |
@@ -688,6 +712,9 @@ function Get-MissingDLLs {
 
         $exeDir = Split-Path $exePath -Parent
 
+        # Skip protected directories (WindowsApps, System32, etc.)
+        if (IsProtectedDirectory -dir $exeDir) { continue }
+
         Write-Progress -Activity "Scanning PE imports" -Status "$current/$total - $($proc.ProcessName)" -PercentComplete (($current/$total)*100)
 
         $imports = Get-PEImports -FilePath $exePath
@@ -697,40 +724,35 @@ function Get-MissingDLLs {
             if (ShouldIgnoreDLL -name $dll) { continue }
 
             $cacheKey = "$exeDir|$dll"
-            if ($missingCache.ContainsKey($cacheKey)) {
-                if ($missingCache[$cacheKey]) {
-                    # Already found missing, add result
-                    $results += [PSCustomObject]@{
-                        Type         = "Missing DLL (PE Import)"
-                        Path         = Join-Path $exeDir $dll
-                        Risk         = "HIGH"
-                        Details      = "Process '$($proc.ProcessName)' imports '$dll' but it was not found in the DLL search path. Planting '$dll' in '$exeDir' would cause it to be loaded."
-                        ProcessName  = $proc.ProcessName
-                        ProcessId    = $proc.Id
-                        DLLName      = $dll
-                        PlantDir     = $exeDir
-                        BinaryPath   = $exePath
-                    }
-                }
-                continue
-            }
+            if ($missingCache.ContainsKey($cacheKey)) { continue }
 
             $resolved = Resolve-DLLPath -DLLName $dll -ApplicationDir $exeDir
             if ($null -eq $resolved) {
                 $missingCache[$cacheKey] = $true
+
+                # Deduplicate by DLL name + directory
+                $findingKey = "$($dll.ToLower())|$($exeDir.ToLower())"
+                if ($seenFindings.ContainsKey($findingKey)) { continue }
+                $seenFindings[$findingKey] = $true
+
                 $dirWritable = Test-WritableDirectory -Path $exeDir
-                $riskLevel = if ($dirWritable) { "CRITICAL" } else { "HIGH" }
-                $writableNote = if ($dirWritable) { " App directory IS WRITABLE." } else { " App directory is not writable -- check PATH dirs." }
+                if ($dirWritable) {
+                    $riskLevel = "CRITICAL"
+                    $writableNote = " App directory IS WRITABLE -- DLL planting possible!"
+                } else {
+                    $riskLevel = "MEDIUM"
+                    $writableNote = " App directory is not writable by current user."
+                }
 
                 Write-Host "  [!] MISSING: $dll (imported by $($proc.ProcessName))" -ForegroundColor Red
                 Write-Host "      Binary: $exePath" -ForegroundColor DarkRed
-                Write-Host "      $writableNote" -ForegroundColor DarkRed
+                Write-Host "      $writableNote" -ForegroundColor $(if ($dirWritable) { "Red" } else { "DarkYellow" })
 
                 $results += [PSCustomObject]@{
                     Type         = "Missing DLL (PE Import)"
                     Path         = Join-Path $exeDir $dll
                     Risk         = $riskLevel
-                    Details      = "Process '$($proc.ProcessName)' imports '$dll' but it was not found in the DLL search path.$writableNote"
+                    Details      = "Process '$($proc.ProcessName)' imports '$dll' -- not found in search path.$writableNote"
                     ProcessName  = $proc.ProcessName
                     ProcessId    = $proc.Id
                     DLLName      = $dll
@@ -763,6 +785,8 @@ function Get-MissingDLLs {
         $scannedBinaries[$exePath] = $true
 
         $exeDir = Split-Path $exePath -Parent
+        if (IsProtectedDirectory -dir $exeDir) { return }
+
         $serviceName = $_.Name
         $serviceUser = $_.StartName
 
@@ -778,18 +802,28 @@ function Get-MissingDLLs {
             $resolved = Resolve-DLLPath -DLLName $dll -ApplicationDir $exeDir
             if ($null -eq $resolved) {
                 $missingCache[$cacheKey] = $true
-                $dirWritable = Test-WritableDirectory -Path $exeDir
-                $riskLevel = if ($dirWritable) { "CRITICAL" } else { "HIGH" }
-                $writableNote = if ($dirWritable) { " Service directory IS WRITABLE." } else { ""  }
 
-                Write-Host "  [!] MISSING: $dll (imported by service '$serviceName', runs as $serviceUser)" -ForegroundColor Red
+                $findingKey = "$($dll.ToLower())|$($exeDir.ToLower())"
+                if ($seenFindings.ContainsKey($findingKey)) { continue }
+                $seenFindings[$findingKey] = $true
+
+                $dirWritable = Test-WritableDirectory -Path $exeDir
+                if ($dirWritable) {
+                    $riskLevel = "CRITICAL"
+                    $writableNote = " Service directory IS WRITABLE -- DLL planting possible!"
+                } else {
+                    $riskLevel = "MEDIUM"
+                    $writableNote = ""
+                }
+
+                Write-Host "  [!] MISSING: $dll (service '$serviceName', runs as $serviceUser)" -ForegroundColor Red
                 Write-Host "      Binary: $exePath" -ForegroundColor DarkRed
 
                 $results += [PSCustomObject]@{
                     Type         = "Missing DLL (Service Import)"
                     Path         = Join-Path $exeDir $dll
                     Risk         = $riskLevel
-                    Details      = "Service '$serviceName' (runs as $serviceUser) imports '$dll' but it was not found.$writableNote"
+                    Details      = "Service '$serviceName' (runs as $serviceUser) imports '$dll' -- not found.$writableNote"
                     ServiceName  = $serviceName
                     ServiceUser  = $serviceUser
                     DLLName      = $dll
@@ -821,21 +855,23 @@ function Get-EventLogDLLErrors {
 
     Write-Host "[*] Checking Event Logs for DLL load failures..." -ForegroundColor Yellow
     $results = @()
+    $seenEvents = @{}
 
     # SideBySide events (activation context failures -- missing dependencies)
     try {
         $sxsEvents = Get-WinEvent -FilterHashtable @{
             LogName = 'Application'
             ProviderName = 'SideBySide'
-        } -MaxEvents 50 -ErrorAction SilentlyContinue
+        } -MaxEvents 20 -ErrorAction SilentlyContinue
 
         foreach ($evt in $sxsEvents) {
-            if ($evt.Message -match "(?i)(\.dll|assembly)") {
+            if ($evt.Message -match "(?i)(\.dll)") {
+                $msgSnippet = $evt.Message.Substring(0, [Math]::Min(200, $evt.Message.Length))
                 $results += [PSCustomObject]@{
                     Type        = "Event Log DLL Error"
                     Path        = ""
                     Risk        = "INFO"
-                    Details     = "SideBySide Event $($evt.Id): $($evt.Message.Substring(0, [Math]::Min(200, $evt.Message.Length)))"
+                    Details     = "SideBySide Event $($evt.Id): $msgSnippet"
                     EventId     = $evt.Id
                     TimeCreated = $evt.TimeCreated
                 }
@@ -845,23 +881,26 @@ function Get-EventLogDLLErrors {
         Write-Verbose "  Could not read SideBySide events."
     }
 
-    # Application Error events that mention DLLs
+    # Application Error events that specifically mention DLL loading
     try {
         $appErrors = Get-WinEvent -FilterHashtable @{
             LogName = 'Application'
             Level = 2  # Error
-        } -MaxEvents 100 -ErrorAction SilentlyContinue
+        } -MaxEvents 50 -ErrorAction SilentlyContinue
 
         foreach ($evt in $appErrors) {
-            if ($evt.Message -match "(?i)(\.dll|module|load|not found)") {
+            # Strict filter: must mention .dll AND a loading-related keyword
+            if ($evt.Message -match "(?i)(\.dll).*(not found|could not be located|failed to load|missing|unable to load)" -or
+                $evt.Message -match "(?i)(not found|could not be located|failed to load|missing|unable to load).*(\.dll)") {
                 $msgSnippet = $evt.Message.Substring(0, [Math]::Min(200, $evt.Message.Length))
-                # Avoid duplicates
-                if (-not ($results | Where-Object { $_.Details -eq "AppError Event $($evt.Id): $msgSnippet" })) {
+                $findingKey = "evt|$msgSnippet"
+                if (-not ($seenEvents.ContainsKey($findingKey))) {
+                    $seenEvents[$findingKey] = $true
                     $results += [PSCustomObject]@{
                         Type        = "Event Log DLL Error"
                         Path        = ""
-                        Risk        = "INFO"
-                        Details     = "AppError Event $($evt.Id): $msgSnippet"
+                        Risk        = "LOW"
+                        Details     = "AppError: $msgSnippet"
                         EventId     = $evt.Id
                         TimeCreated = $evt.TimeCreated
                     }
@@ -872,23 +911,29 @@ function Get-EventLogDLLErrors {
         Write-Verbose "  Could not read Application Error events."
     }
 
-    # System events -- Service Control Manager failures
+    # System events -- only Service Control Manager failures mentioning DLLs specifically
     try {
         $svcErrors = Get-WinEvent -FilterHashtable @{
             LogName = 'System'
             ProviderName = 'Service Control Manager'
             Level = 2
-        } -MaxEvents 50 -ErrorAction SilentlyContinue
+        } -MaxEvents 30 -ErrorAction SilentlyContinue
 
         foreach ($evt in $svcErrors) {
-            if ($evt.Message -match "(?i)(\.dll|module|dependency|not found|failed to start)") {
-                $results += [PSCustomObject]@{
-                    Type        = "Event Log Service Error"
-                    Path        = ""
-                    Risk        = "LOW"
-                    Details     = "SCM Event $($evt.Id): $($evt.Message.Substring(0, [Math]::Min(200, $evt.Message.Length)))"
-                    EventId     = $evt.Id
-                    TimeCreated = $evt.TimeCreated
+            # Only match events that specifically mention DLL issues
+            if ($evt.Message -match "(?i)(\.dll|dependency.*service|dynamic.link)") {
+                $msgSnippet = $evt.Message.Substring(0, [Math]::Min(200, $evt.Message.Length))
+                $findingKey = "scm|$msgSnippet"
+                if (-not ($seenEvents.ContainsKey($findingKey))) {
+                    $seenEvents[$findingKey] = $true
+                    $results += [PSCustomObject]@{
+                        Type        = "Event Log Service Error"
+                        Path        = ""
+                        Risk        = "LOW"
+                        Details     = "SCM: $msgSnippet"
+                        EventId     = $evt.Id
+                        TimeCreated = $evt.TimeCreated
+                    }
                 }
             }
         }
