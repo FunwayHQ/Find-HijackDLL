@@ -5,7 +5,9 @@
 .DESCRIPTION
     Enumerates services, scheduled tasks, and running processes to identify
     DLL hijacking vectors on Windows systems. Checks for writable directories
-    in PATH, writable service binary directories, and known hijackable DLLs.
+    in PATH, writable service binary directories, known hijackable DLLs,
+    and parses PE import tables to find missing DLLs that processes try
+    to load but can't find (the Procmon "NAME NOT FOUND" replacement).
 
     Designed for penetration testers who cannot run Procmon on a target
     (restricted environments, no GUI, limited tooling).
@@ -27,8 +29,8 @@
 function Write-Banner {
     Write-Host ""
     Write-Host "============================================================" -ForegroundColor Cyan
-    Write-Host "  Find-DLLHijack v1.0 -- DLL Hijacking Discovery Tool" -ForegroundColor Cyan
-    Write-Host "  No Procmon Required" -ForegroundColor DarkCyan
+    Write-Host "  Find-DLLHijack v2.0 -- DLL Hijacking Discovery Tool" -ForegroundColor Cyan
+    Write-Host "  No Procmon Required | Missing DLL Detection" -ForegroundColor DarkCyan
     Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host ""
 }
@@ -428,6 +430,484 @@ function Get-DLLSearchOrderInfo {
     }
 }
 
+function Get-PEImports {
+    <#
+    .SYNOPSIS
+        Parse the import table of a PE file and return imported DLL names.
+        Pure PowerShell -- no external tools required.
+    #>
+    param([string]$FilePath)
+
+    if (-not (Test-Path $FilePath)) { return @() }
+
+    try {
+        $stream = [System.IO.File]::OpenRead($FilePath)
+        $reader = New-Object System.IO.BinaryReader($stream)
+
+        # DOS Header: check MZ signature
+        $dosSignature = $reader.ReadUInt16()
+        if ($dosSignature -ne 0x5A4D) {
+            $reader.Close(); $stream.Close()
+            return @()
+        }
+
+        # e_lfanew: offset to PE header at 0x3C
+        $stream.Position = 0x3C
+        $peOffset = $reader.ReadUInt32()
+
+        # PE Signature
+        $stream.Position = $peOffset
+        $peSignature = $reader.ReadUInt32()
+        if ($peSignature -ne 0x00004550) {
+            $reader.Close(); $stream.Close()
+            return @()
+        }
+
+        # COFF Header
+        $machine = $reader.ReadUInt16()
+        $numberOfSections = $reader.ReadUInt16()
+        $stream.Position += 12  # Skip TimeDateStamp, PointerToSymbolTable, NumberOfSymbols
+        $sizeOfOptionalHeader = $reader.ReadUInt16()
+        $characteristics = $reader.ReadUInt16()
+
+        # Optional Header
+        $optionalHeaderStart = $stream.Position
+        $magic = $reader.ReadUInt16()
+
+        if ($magic -eq 0x10B) {
+            # PE32
+            $stream.Position = $optionalHeaderStart + 104
+            $importDirRVA = $reader.ReadUInt32()
+            $importDirSize = $reader.ReadUInt32()
+        } elseif ($magic -eq 0x20B) {
+            # PE32+ (64-bit)
+            $stream.Position = $optionalHeaderStart + 120
+            $importDirRVA = $reader.ReadUInt32()
+            $importDirSize = $reader.ReadUInt32()
+        } else {
+            $reader.Close(); $stream.Close()
+            return @()
+        }
+
+        if ($importDirRVA -eq 0) {
+            $reader.Close(); $stream.Close()
+            return @()
+        }
+
+        # Read section headers to map RVA to file offset
+        $stream.Position = $optionalHeaderStart + $sizeOfOptionalHeader
+        $sections = @()
+        for ($i = 0; $i -lt $numberOfSections; $i++) {
+            $sectionName = [System.Text.Encoding]::ASCII.GetString($reader.ReadBytes(8)).Trim("`0")
+            $virtualSize = $reader.ReadUInt32()
+            $virtualAddress = $reader.ReadUInt32()
+            $rawDataSize = $reader.ReadUInt32()
+            $rawDataPointer = $reader.ReadUInt32()
+            $stream.Position += 16  # Skip remaining section fields
+
+            $sections += [PSCustomObject]@{
+                Name            = $sectionName
+                VirtualAddress  = $virtualAddress
+                VirtualSize     = $virtualSize
+                RawDataPointer  = $rawDataPointer
+                RawDataSize     = $rawDataSize
+            }
+        }
+
+        # Convert RVA to file offset
+        function Convert-RVAToOffset {
+            param([uint32]$rva)
+            foreach ($section in $sections) {
+                if ($rva -ge $section.VirtualAddress -and
+                    $rva -lt ($section.VirtualAddress + $section.VirtualSize)) {
+                    return $rva - $section.VirtualAddress + $section.RawDataPointer
+                }
+            }
+            return $null
+        }
+
+        # Read Import Directory Table
+        $importOffset = Convert-RVAToOffset -rva $importDirRVA
+        if ($null -eq $importOffset) {
+            $reader.Close(); $stream.Close()
+            return @()
+        }
+
+        $importedDLLs = @()
+        $stream.Position = $importOffset
+
+        while ($true) {
+            $originalFirstThunk = $reader.ReadUInt32()
+            $timeDateStamp = $reader.ReadUInt32()
+            $forwarderChain = $reader.ReadUInt32()
+            $nameRVA = $reader.ReadUInt32()
+            $firstThunk = $reader.ReadUInt32()
+
+            # Null entry terminates the import directory
+            if ($nameRVA -eq 0) { break }
+
+            $nameOffset = Convert-RVAToOffset -rva $nameRVA
+            if ($null -eq $nameOffset) { continue }
+
+            # Read the DLL name
+            $savedPos = $stream.Position
+            $stream.Position = $nameOffset
+            $nameBytes = @()
+            while ($true) {
+                $b = $reader.ReadByte()
+                if ($b -eq 0) { break }
+                $nameBytes += $b
+                if ($nameBytes.Count -gt 260) { break }
+            }
+            $dllName = [System.Text.Encoding]::ASCII.GetString($nameBytes)
+            $stream.Position = $savedPos
+
+            if ($dllName -ne "") {
+                $importedDLLs += $dllName.ToLower()
+            }
+        }
+
+        $reader.Close()
+        $stream.Close()
+        return ($importedDLLs | Sort-Object -Unique)
+    } catch {
+        if ($reader) { try { $reader.Close() } catch {} }
+        if ($stream) { try { $stream.Close() } catch {} }
+        return @()
+    }
+}
+
+function Resolve-DLLPath {
+    <#
+    .SYNOPSIS
+        Simulate Windows DLL search order for a given DLL name relative to an application.
+        Returns the path where Windows would find it, or $null if not found anywhere.
+    #>
+    param(
+        [string]$DLLName,
+        [string]$ApplicationDir
+    )
+
+    # KnownDLLs are always loaded from System32 -- skip these
+    $knownDLLsPath = "HKLM:\System\CurrentControlSet\Control\Session Manager\KnownDLLs"
+    try {
+        $knownDLLs = Get-ItemProperty -Path $knownDLLsPath -ErrorAction SilentlyContinue
+        $knownDLLValues = $knownDLLs.PSObject.Properties |
+            Where-Object { $_.Name -notmatch "^PS" } |
+            ForEach-Object { $_.Value.ToLower() }
+        if ($knownDLLValues -contains $DLLName.ToLower()) {
+            return (Join-Path "$env:SystemRoot\System32" $DLLName)
+        }
+    } catch {}
+
+    # Check SafeDllSearchMode
+    $safeDllSearch = $true
+    try {
+        $regValue = Get-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Session Manager" -Name "SafeDllSearchMode" -ErrorAction SilentlyContinue
+        if ($regValue -and $regValue.SafeDllSearchMode -eq 0) {
+            $safeDllSearch = $false
+        }
+    } catch {}
+
+    # Build search order
+    $searchPaths = @()
+    $searchPaths += $ApplicationDir
+    if (-not $safeDllSearch) {
+        $searchPaths += (Get-Location).Path
+    }
+    $searchPaths += "$env:SystemRoot\System32"
+    $searchPaths += "$env:SystemRoot\System"
+    $searchPaths += "$env:SystemRoot"
+    if ($safeDllSearch) {
+        $searchPaths += (Get-Location).Path
+    }
+    $env:PATH -split ';' | Where-Object { $_ -ne '' } | ForEach-Object {
+        $searchPaths += $_.Trim()
+    }
+
+    # Search
+    foreach ($dir in $searchPaths) {
+        $fullPath = Join-Path $dir $DLLName
+        if (Test-Path $fullPath) {
+            return $fullPath
+        }
+    }
+
+    return $null
+}
+
+function Get-MissingDLLs {
+    <#
+    .SYNOPSIS
+        Parse PE import tables of running processes and services to find DLLs
+        that are imported but don't exist anywhere in the DLL search path.
+        These are prime candidates for DLL planting.
+        This is the Procmon "NAME NOT FOUND" equivalent.
+    #>
+
+    Write-Host "[*] Scanning for missing DLLs (PE import table analysis)..." -ForegroundColor Yellow
+    Write-Host "    This may take a moment..." -ForegroundColor DarkYellow
+    $results = @()
+    $scannedBinaries = @{}
+    $missingCache = @{}
+
+    # System DLLs to ignore (API sets, virtual DLLs that are resolved by the loader)
+    $ignorePrefixes = @("api-ms-", "ext-ms-", "ieshims")
+    $ignoreDLLs = @(
+        "kernel32.dll", "ntdll.dll", "user32.dll", "gdi32.dll",
+        "advapi32.dll", "shell32.dll", "ole32.dll", "oleaut32.dll",
+        "msvcrt.dll", "ucrtbase.dll", "combase.dll", "rpcrt4.dll",
+        "sechost.dll", "bcrypt.dll", "kernelbase.dll", "msvcp_win.dll",
+        "win32u.dll", "mscoree.dll", "vcruntime140.dll", "vcruntime140d.dll",
+        "ucrtbased.dll", "msvcp140.dll", "msvcp140d.dll"
+    )
+
+    function ShouldIgnoreDLL {
+        param([string]$name)
+        $lower = $name.ToLower()
+        if ($ignoreDLLs -contains $lower) { return $true }
+        foreach ($prefix in $ignorePrefixes) {
+            if ($lower.StartsWith($prefix)) { return $true }
+        }
+        return $false
+    }
+
+    # Scan running processes
+    $processes = Get-Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path } |
+        Sort-Object -Property Path -Unique
+
+    $total = $processes.Count
+    $current = 0
+
+    foreach ($proc in $processes) {
+        $current++
+        $exePath = $proc.Path
+        if ($scannedBinaries.ContainsKey($exePath)) { continue }
+        $scannedBinaries[$exePath] = $true
+
+        $exeDir = Split-Path $exePath -Parent
+
+        Write-Progress -Activity "Scanning PE imports" -Status "$current/$total - $($proc.ProcessName)" -PercentComplete (($current/$total)*100)
+
+        $imports = Get-PEImports -FilePath $exePath
+        if (-not $imports -or $imports.Count -eq 0) { continue }
+
+        foreach ($dll in $imports) {
+            if (ShouldIgnoreDLL -name $dll) { continue }
+
+            $cacheKey = "$exeDir|$dll"
+            if ($missingCache.ContainsKey($cacheKey)) {
+                if ($missingCache[$cacheKey]) {
+                    # Already found missing, add result
+                    $results += [PSCustomObject]@{
+                        Type         = "Missing DLL (PE Import)"
+                        Path         = Join-Path $exeDir $dll
+                        Risk         = "HIGH"
+                        Details      = "Process '$($proc.ProcessName)' imports '$dll' but it was not found in the DLL search path. Planting '$dll' in '$exeDir' would cause it to be loaded."
+                        ProcessName  = $proc.ProcessName
+                        ProcessId    = $proc.Id
+                        DLLName      = $dll
+                        PlantDir     = $exeDir
+                        BinaryPath   = $exePath
+                    }
+                }
+                continue
+            }
+
+            $resolved = Resolve-DLLPath -DLLName $dll -ApplicationDir $exeDir
+            if ($null -eq $resolved) {
+                $missingCache[$cacheKey] = $true
+                $dirWritable = Test-WritableDirectory -Path $exeDir
+                $riskLevel = if ($dirWritable) { "CRITICAL" } else { "HIGH" }
+                $writableNote = if ($dirWritable) { " App directory IS WRITABLE." } else { " App directory is not writable -- check PATH dirs." }
+
+                Write-Host "  [!] MISSING: $dll (imported by $($proc.ProcessName))" -ForegroundColor Red
+                Write-Host "      Binary: $exePath" -ForegroundColor DarkRed
+                Write-Host "      $writableNote" -ForegroundColor DarkRed
+
+                $results += [PSCustomObject]@{
+                    Type         = "Missing DLL (PE Import)"
+                    Path         = Join-Path $exeDir $dll
+                    Risk         = $riskLevel
+                    Details      = "Process '$($proc.ProcessName)' imports '$dll' but it was not found in the DLL search path.$writableNote"
+                    ProcessName  = $proc.ProcessName
+                    ProcessId    = $proc.Id
+                    DLLName      = $dll
+                    PlantDir     = $exeDir
+                    BinaryPath   = $exePath
+                    DirWritable  = $dirWritable
+                }
+            } else {
+                $missingCache[$cacheKey] = $false
+            }
+        }
+    }
+
+    Write-Progress -Activity "Scanning PE imports" -Completed
+
+    # Also scan service binaries (some may not be running right now)
+    Write-Host "    Scanning service binaries..." -ForegroundColor DarkYellow
+    Get-WmiObject Win32_Service -ErrorAction SilentlyContinue | ForEach-Object {
+        $pathName = $_.PathName
+        if (-not $pathName) { return }
+
+        if ($pathName.StartsWith('"')) {
+            $exePath = ($pathName -split '"')[1]
+        } else {
+            $exePath = ($pathName -split ' ')[0]
+        }
+
+        if ($scannedBinaries.ContainsKey($exePath)) { return }
+        if (-not (Test-Path $exePath -ErrorAction SilentlyContinue)) { return }
+        $scannedBinaries[$exePath] = $true
+
+        $exeDir = Split-Path $exePath -Parent
+        $serviceName = $_.Name
+        $serviceUser = $_.StartName
+
+        $imports = Get-PEImports -FilePath $exePath
+        if (-not $imports -or $imports.Count -eq 0) { return }
+
+        foreach ($dll in $imports) {
+            if (ShouldIgnoreDLL -name $dll) { continue }
+
+            $cacheKey = "$exeDir|$dll"
+            if ($missingCache.ContainsKey($cacheKey)) { continue }
+
+            $resolved = Resolve-DLLPath -DLLName $dll -ApplicationDir $exeDir
+            if ($null -eq $resolved) {
+                $missingCache[$cacheKey] = $true
+                $dirWritable = Test-WritableDirectory -Path $exeDir
+                $riskLevel = if ($dirWritable) { "CRITICAL" } else { "HIGH" }
+                $writableNote = if ($dirWritable) { " Service directory IS WRITABLE." } else { ""  }
+
+                Write-Host "  [!] MISSING: $dll (imported by service '$serviceName', runs as $serviceUser)" -ForegroundColor Red
+                Write-Host "      Binary: $exePath" -ForegroundColor DarkRed
+
+                $results += [PSCustomObject]@{
+                    Type         = "Missing DLL (Service Import)"
+                    Path         = Join-Path $exeDir $dll
+                    Risk         = $riskLevel
+                    Details      = "Service '$serviceName' (runs as $serviceUser) imports '$dll' but it was not found.$writableNote"
+                    ServiceName  = $serviceName
+                    ServiceUser  = $serviceUser
+                    DLLName      = $dll
+                    PlantDir     = $exeDir
+                    BinaryPath   = $exePath
+                    DirWritable  = $dirWritable
+                }
+            } else {
+                $missingCache[$cacheKey] = $false
+            }
+        }
+    }
+
+    if ($results.Count -eq 0) {
+        Write-Host "  [OK] No missing DLLs found in PE import tables." -ForegroundColor Green
+    } else {
+        Write-Host "  Found $($results.Count) missing DLL(s)!" -ForegroundColor Red
+    }
+
+    return $results
+}
+
+function Get-EventLogDLLErrors {
+    <#
+    .SYNOPSIS
+        Check Windows Event Logs for DLL loading failures.
+        SideBySide errors (Event ID 33, 80) and Application errors often reveal missing DLLs.
+    #>
+
+    Write-Host "[*] Checking Event Logs for DLL load failures..." -ForegroundColor Yellow
+    $results = @()
+
+    # SideBySide events (activation context failures -- missing dependencies)
+    try {
+        $sxsEvents = Get-WinEvent -FilterHashtable @{
+            LogName = 'Application'
+            ProviderName = 'SideBySide'
+        } -MaxEvents 50 -ErrorAction SilentlyContinue
+
+        foreach ($evt in $sxsEvents) {
+            if ($evt.Message -match "(?i)(\.dll|assembly)") {
+                $results += [PSCustomObject]@{
+                    Type        = "Event Log DLL Error"
+                    Path        = ""
+                    Risk        = "INFO"
+                    Details     = "SideBySide Event $($evt.Id): $($evt.Message.Substring(0, [Math]::Min(200, $evt.Message.Length)))"
+                    EventId     = $evt.Id
+                    TimeCreated = $evt.TimeCreated
+                }
+            }
+        }
+    } catch {
+        Write-Verbose "  Could not read SideBySide events."
+    }
+
+    # Application Error events that mention DLLs
+    try {
+        $appErrors = Get-WinEvent -FilterHashtable @{
+            LogName = 'Application'
+            Level = 2  # Error
+        } -MaxEvents 100 -ErrorAction SilentlyContinue
+
+        foreach ($evt in $appErrors) {
+            if ($evt.Message -match "(?i)(\.dll|module|load|not found)") {
+                $msgSnippet = $evt.Message.Substring(0, [Math]::Min(200, $evt.Message.Length))
+                # Avoid duplicates
+                if (-not ($results | Where-Object { $_.Details -eq "AppError Event $($evt.Id): $msgSnippet" })) {
+                    $results += [PSCustomObject]@{
+                        Type        = "Event Log DLL Error"
+                        Path        = ""
+                        Risk        = "INFO"
+                        Details     = "AppError Event $($evt.Id): $msgSnippet"
+                        EventId     = $evt.Id
+                        TimeCreated = $evt.TimeCreated
+                    }
+                }
+            }
+        }
+    } catch {
+        Write-Verbose "  Could not read Application Error events."
+    }
+
+    # System events -- Service Control Manager failures
+    try {
+        $svcErrors = Get-WinEvent -FilterHashtable @{
+            LogName = 'System'
+            ProviderName = 'Service Control Manager'
+            Level = 2
+        } -MaxEvents 50 -ErrorAction SilentlyContinue
+
+        foreach ($evt in $svcErrors) {
+            if ($evt.Message -match "(?i)(\.dll|module|dependency|not found|failed to start)") {
+                $results += [PSCustomObject]@{
+                    Type        = "Event Log Service Error"
+                    Path        = ""
+                    Risk        = "LOW"
+                    Details     = "SCM Event $($evt.Id): $($evt.Message.Substring(0, [Math]::Min(200, $evt.Message.Length)))"
+                    EventId     = $evt.Id
+                    TimeCreated = $evt.TimeCreated
+                }
+            }
+        }
+    } catch {
+        Write-Verbose "  Could not read Service Control Manager events."
+    }
+
+    if ($results.Count -eq 0) {
+        Write-Host "  [OK] No DLL-related errors found in event logs." -ForegroundColor Green
+    } else {
+        Write-Host "  Found $($results.Count) DLL-related event(s)." -ForegroundColor Yellow
+        foreach ($r in $results) {
+            Write-Host "  [i] $($r.Details)" -ForegroundColor DarkYellow
+        }
+    }
+
+    return $results
+}
+
 function Invoke-DLLHijackScan {
     <#
     .SYNOPSIS
@@ -498,6 +978,18 @@ function Invoke-DLLHijackScan {
     $allResults += $taskResults
     Write-Host ""
 
+    # 7. Missing DLLs (PE import table analysis -- the Procmon replacement)
+    if (-not $SkipProcesses) {
+        $missingResults = Get-MissingDLLs
+        $allResults += $missingResults
+        Write-Host ""
+    }
+
+    # 8. Event log DLL errors
+    $eventResults = Get-EventLogDLLErrors
+    $allResults += $eventResults
+    Write-Host ""
+
     # Summary
     Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host "  SUMMARY" -ForegroundColor Cyan
@@ -506,6 +998,8 @@ function Invoke-DLLHijackScan {
     $critical = ($allResults | Where-Object { $_.Risk -eq "CRITICAL" }).Count
     $high = ($allResults | Where-Object { $_.Risk -eq "HIGH" }).Count
     $medium = ($allResults | Where-Object { $_.Risk -eq "MEDIUM" }).Count
+    $low = ($allResults | Where-Object { $_.Risk -eq "LOW" }).Count
+    $info = ($allResults | Where-Object { $_.Risk -eq "INFO" }).Count
 
     if ($allResults.Count -eq 0) {
         Write-Host "  No DLL hijacking opportunities found." -ForegroundColor Green
@@ -514,9 +1008,16 @@ function Invoke-DLLHijackScan {
         if ($critical -gt 0) { Write-Host "    CRITICAL: $critical" -ForegroundColor Red }
         if ($high -gt 0) { Write-Host "    HIGH:     $high" -ForegroundColor Red }
         if ($medium -gt 0) { Write-Host "    MEDIUM:   $medium" -ForegroundColor Yellow }
+        if ($low -gt 0) { Write-Host "    LOW:      $low" -ForegroundColor DarkYellow }
+        if ($info -gt 0) { Write-Host "    INFO:     $info" -ForegroundColor Gray }
         Write-Host ""
 
-        $allResults | Format-Table Type, Risk, Path, Details -AutoSize -Wrap
+        # Show actionable findings (not INFO)
+        $actionable = $allResults | Where-Object { $_.Risk -ne "INFO" }
+        if ($actionable.Count -gt 0) {
+            Write-Host "  Actionable findings:" -ForegroundColor Yellow
+            $actionable | Format-Table Type, Risk, DLLName, PlantDir, Details -AutoSize -Wrap
+        }
     }
 
     # Export if requested
