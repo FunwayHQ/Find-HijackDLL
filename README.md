@@ -154,7 +154,3 @@ MIT
 - Inspired by [PowerUp](https://github.com/PowerShellMafia/PowerSploit/blob/master/Privesc/PowerUp.ps1) service enumeration
 - [LOLBAS](https://lolbas-project.github.io/) for DLL hijacking research
 - [Hijack Libs](https://hijacklibs.net/) for known hijackable DLL database
-
-## See Also
-
-- [Windows Privilege Escalation: Parent PID Spoofing with SeDebugPrivilege](TODO) — companion blog post on another overlooked privesc technique
