@@ -141,6 +141,10 @@ DLLs listed in `HKLM\System\CurrentControlSet\Control\Session Manager\KnownDLLs`
 
 Found a commonly hijacked DLL that's not in the list? A service that frequently has writable directories? Open a PR or issue.
 
+## Disclaimer
+
+This tool is provided for **authorized security testing and defensive auditing purposes only**. Usage of Find-DLLHijack for attacking systems without prior mutual consent is illegal. The author and Funway Interactive assume no liability and are not responsible for any misuse or damage caused by this tool. It is the end user's responsibility to comply with all applicable local, state, federal, and international laws. Only use this tool on systems you own or have explicit written authorization to test.
+
 ## License
 
 MIT
@@ -150,3 +154,7 @@ MIT
 - Inspired by [PowerUp](https://github.com/PowerShellMafia/PowerSploit/blob/master/Privesc/PowerUp.ps1) service enumeration
 - [LOLBAS](https://lolbas-project.github.io/) for DLL hijacking research
 - [Hijack Libs](https://hijacklibs.net/) for known hijackable DLL database
+
+## See Also
+
+- [Windows Privilege Escalation: Parent PID Spoofing with SeDebugPrivilege](TODO) — companion blog post on another overlooked privesc technique
