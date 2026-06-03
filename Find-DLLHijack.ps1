@@ -13,9 +13,19 @@
     (restricted environments, no GUI, limited tooling).
 
 .NOTES
-    Author:  Dimitry / Funway Interactive SRL
+    Author:  Dimitry / Funway Interactive
     License: MIT
     URL:     https://github.com/FunwayHQ/Find-HijackDLL
+
+    LEGAL DISCLAIMER:
+    This tool is provided for authorized security testing and defensive
+    auditing purposes only. Usage of Find-DLLHijack for attacking systems
+    without prior mutual consent is illegal. The author and Funway
+    Interactive assume no liability and are not responsible for any misuse
+    or damage caused by this tool. It is the end user's responsibility to
+    comply with all applicable local, state, federal, and international laws.
+    Only use this tool on systems you own or have explicit written
+    authorization to test.
 
 .EXAMPLE
     . .\Find-DLLHijack.ps1
@@ -31,7 +41,10 @@ function Write-Banner {
     Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host "  Find-DLLHijack v2.0 -- DLL Hijacking Discovery Tool" -ForegroundColor Cyan
     Write-Host "  No Procmon Required | Missing DLL Detection" -ForegroundColor DarkCyan
+    Write-Host "  https://github.com/FunwayHQ/Find-HijackDLL" -ForegroundColor DarkCyan
     Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "  [!] For authorized security testing and auditing only." -ForegroundColor Yellow
+    Write-Host "  [!] Ensure you have written permission before use." -ForegroundColor Yellow
     Write-Host ""
 }
 
